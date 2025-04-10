@@ -86,7 +86,6 @@ class GSRasterizer(object):
         mean_coord_x = ((mean_ndc[..., 0] + 1) * camera.image_width - 1.0) * 0.5
         mean_coord_y = ((mean_ndc[..., 1] + 1) * camera.image_height - 1.0) * 0.5
         mean_2d = torch.stack([mean_coord_x, mean_coord_y], dim=-1)
-
         color = self.render(
             camera=camera, 
             mean_2d=mean_2d,
@@ -138,14 +137,13 @@ class GSRasterizer(object):
         # ========================================================
         # TODO: Implement the projection to NDC space
         points_h = homogenize(points)
-        p_view = points_h @ w2c.T
-        p_proj = p_view @ proj_mat.T
+        p_view = points_h @ w2c
+        p_proj = p_view @ proj_mat
         p_ndc = p_proj / p_proj[..., 3:4]
 
         # TODO: Cull points that are close or behind the camera
-        in_mask = p_ndc[..., 2] > z_near
+        in_mask = p_ndc[..., 2] >= z_near
         # ========================================================
-
         return p_ndc, p_view, in_mask
 
     @torch.no_grad()
@@ -180,21 +178,22 @@ class GSRasterizer(object):
         # ========================================================
         # TODO: Transform 3D mean coordinates to camera space
         mean_3d_h = homogenize(mean_3d)
-        mean_view = mean_3d_h @ w2c.T
+        mean_view = mean_3d_h @ w2c
         mean_view = mean_view[..., :3] / mean_view[..., 3:4]
         mean_3d = mean_view[..., :3]
+        # mean_3d = (mean_3d @ w2c[:3, :3]) + w2c[-1:, :3]
         # ========================================================
 
         # Transpose the rigid transformation part of the world-to-camera matrix
         J = torch.zeros(mean_3d.shape[0], 3, 3).to(mean_3d)
         W = w2c[:3, :3].T
+        # ========================================================
+        # TODO: Compute Jacobian of view transform and projection
         J[:, 0, 0] = f_x / mean_3d[:, 2]
         J[:, 1, 1] = f_y / mean_3d[:, 2]
         J[:, 0, 2] = -f_x * mean_3d[:, 0] / (mean_3d[:, 2]**2)
         J[:, 1, 2] = -f_y * mean_3d[:, 1] / (mean_3d[:, 2]**2)
-        # ========================================================
-        # TODO: Compute Jacobian of view transform and projection
-        cov_2d = J @ W @ cov_3d @ W.transpose(1, 2) @ J.transpose(1, 2)
+        cov_2d = J @ W @ cov_3d @ W.transpose(0, 1) @ J.transpose(1, 2)
         # ========================================================
 
         # add low pass filter here according to E.q. 32
@@ -239,29 +238,28 @@ class GSRasterizer(object):
                 # TODO: Sort the projected Gaussians that lie in the current tile by their depths, in ascending order
                 sorted_idx = torch.argsort(depths[in_mask])
                 sorted_mean_2d = mean_2d[in_mask][sorted_idx] # [m, 2]
-                sorted_cov_2d = cov_2d[in_mask][sorted_idx] # [m, 2, 2]
+                sorted_cov_2d_inv = cov_2d[in_mask][sorted_idx].inverse() # [m, 2, 2]
                 sorted_color = color[in_mask][sorted_idx] # [m, 3]
                 sorted_opacities = opacities[in_mask][sorted_idx] # [m, 1]
                 # ========================================================
                 
                 # ========================================================
                 # TODO: Compute the displacement vector from the 2D mean coordinates to the pixel coordinates
-                disp_vec = pix_coord[w:w+self.tile_size, h:h+self.tile_size] - sorted_mean_2d # [tw, th, m, 2]
-                disp_vec = disp_vec.reshape(..., 1) # [tw, th, m, 2, 1]
+                disp_vec = pix_coord[h:h+self.tile_size, w:w+self.tile_size].unsqueeze(2) - sorted_mean_2d.unsqueeze(0).unsqueeze(0) # [t, t, m, 2]
+                disp_vec = disp_vec.unsqueeze(-1) # [t, t, m, 2, 1]
                 # ========================================================
 
                 # ========================================================
                 # TODO: Compute the Gaussian weight for each pixel in the tile
                 # ========================================================
-                gaussian_weight = torch.exp(-1/2 * disp_vec.T @ torch.linalg.inv(sorted_cov_2d) @ disp_vec) # [tw, th, m]
+                gaussian_weight = torch.exp(-1/2 * disp_vec.transpose(3, 4) @ sorted_cov_2d_inv @ disp_vec).squeeze(-1) # [tw, th, m, 1]
                 # ========================================================
                 # TODO: Perform alpha blending
-                weighted_opacity = sorted_opacities[..., None] * gaussian_weight # [tw, th, m, 1]
-                prods = torch.ones_like(weighted_opacity) # [tw, th, m, 1]
-                for i in range(1, weighted_opacity.shape[-2]):
-                    prods[..., i, 0] = prods[..., i-1, 0] * (1 - weighted_opacity[..., i, 0])
-                
-                tile_color = torch.sum(sorted_color[..., None] * weighted_opacity * prods, dim=-2) # [tw, th, 3]
+                weighted_opacity = (sorted_opacities * gaussian_weight) # [t, t, m, 1]
+                prods = torch.cat([torch.ones_like(weighted_opacity[:, :, 0].unsqueeze(-1)),
+                                   torch.cumprod((1-weighted_opacity)[:, :, :-1], dim=-2)], dim=-2) # [t, t, m, 1]
+                acc_prods = (weighted_opacity * prods).sum(dim=-2)
+                tile_color = torch.sum(sorted_color * weighted_opacity * prods, dim=-2) + (1 - acc_prods) # [t, t, 3]
                 # ========================================================
 
                 render_color[h:h+self.tile_size, w:w+self.tile_size] = tile_color.reshape(self.tile_size, self.tile_size, -1)
